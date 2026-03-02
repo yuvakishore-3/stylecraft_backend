@@ -10,6 +10,13 @@ app = FastAPI()
 
 # Initialize MediaPipe on first use
 _hair_segmenter = None
+_mask_cache = {} # cache for hair masks: {image_hash: mask_array}
+
+def get_image_hash(image: Image.Image):
+    """Generate a simple hash for the image to use as cache key."""
+    import hashlib
+    hash_obj = hashlib.md5(image.tobytes())
+    return hash_obj.hexdigest()
 
 def get_hair_segmenter():
     """Lazy-load MediaPipe Image Segmenter for hair detection."""
@@ -130,6 +137,11 @@ def segment_hair_multiclass(pil_image: Image.Image):
     - 4: Clothes
     - 5: Others/Accessories
     """
+    img_hash = get_image_hash(pil_image)
+    if img_hash in _mask_cache:
+        # print(f"Using cached hair mask for {img_hash}")
+        return _mask_cache[img_hash]
+
     import mediapipe as mp
     import cv2
     
@@ -169,6 +181,11 @@ def segment_hair_multiclass(pil_image: Image.Image):
     
     # Gaussian blur for smooth edges
     hair_mask = cv2.GaussianBlur(hair_mask, (7, 7), 0)
+    
+    # Cache and return
+    if len(_mask_cache) > 50: # Limit cache size
+        _mask_cache.pop(next(iter(_mask_cache)))
+    _mask_cache[img_hash] = hair_mask
     
     return hair_mask
 
@@ -307,9 +324,44 @@ async def analyze_face_endpoint(image: UploadFile = File(...)):
         pil_image = correct_image_orientation(pil_image)
         face_shape, confidence = analyze_face_shape(pil_image)
         
+        # Gender Detection
+        gender = "Female" # Default
+        if os.environ.get("REPLICATE_API_TOKEN"):
+            try:
+                # Use a small visual LLM to detect gender accurately
+                temp_path = "temp_gender_check.jpg"
+                pil_image.save(temp_path)
+                
+                output = replicate.run(
+                    "yorickvp/llava-13b:b6f4c549320e6f6cb15f8a07f354a88f7c97800c14b31a80d5b5ddcd68d06e22",
+                    input={
+                        "image": open(temp_path, "rb"),
+                        "prompt": "Is the person in this photo a boy or a girl? Reply with only one word: 'Male' or 'Female'.",
+                        "max_tokens": 5
+                    }
+                )
+                
+                result_text = "".join(output).strip().lower()
+                if "male" in result_text or "boy" in result_text or "man" in result_text:
+                    gender = "Male"
+                else:
+                    gender = "Female"
+                
+                os.remove(temp_path)
+            except Exception as e:
+                print(f"Gender detection Error: {e}")
+                # Fallback heuristic: simple ratio check (very basic)
+                width, height = pil_image.size
+                if width/height > 0.8: gender = "Male"
+        else:
+            # Fallback heuristic if no API key
+            width, height = pil_image.size
+            if width/height > 0.8: gender = "Male"
+
         return JSONResponse({
             "faceShape": face_shape,
-            "confidence": confidence
+            "confidence": confidence,
+            "gender": gender
         })
     
     except Exception as e:
@@ -438,6 +490,7 @@ async def apply_hair_adjustments_endpoint(
         if color and color.strip():
             pil_image = apply_color_to_hair(pil_image, hair_mask, color, colorIntensity)
         
+
         # Apply adjustments to hair only
         result_image = apply_adjustments_to_hair(
             pil_image, hair_mask,
@@ -465,3 +518,79 @@ async def apply_hair_adjustments_endpoint(
             status_code=500,
             content={"error": f"Adjustment failed: {str(e)}"}
         )
+
+# -----------------------------------------------------------------------------
+# 4) AI HAIRSTYLE GENERATION (Replicate / HairFastGAN)
+# -----------------------------------------------------------------------------
+import replicate
+import shutil
+import os
+
+@app.post("/generate-hairstyle")
+async def generate_hairstyle(
+    file: UploadFile = File(...),
+    hairstyle_ref: UploadFile = File(...)
+):
+    """
+    Receives user face image + reference hairstyle image.
+    Sends them to Replicate (HairFastGAN) to transfer the hairstyle.
+    Returns the URL of the generated image.
+    """
+    try:
+        # Save temporary files
+        user_path = f"temp_user_{file.filename}"
+        ref_path = f"temp_ref_{hairstyle_ref.filename}"
+
+        with open(user_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+        
+        with open(ref_path, "wb") as buffer:
+            shutil.copyfileobj(hairstyle_ref.file, buffer)
+
+        # Initialize Replicate Client (Expects REPLICATE_API_TOKEN in env)
+        # For now, we use a placeholder or check if token is set
+        if not os.environ.get("REPLICATE_API_TOKEN"):
+             print("WARNING: REPLICATE_API_TOKEN not set!")
+             # Return a mock response for testing if no key yet
+             return JSONResponse(content={
+                 "status": "mock_success",
+                 "generated_image_url": "https://replicate.delivery/pbxt/MockResult/out.png",
+                 "message": "API Key missing. This is a mock response."
+             })
+
+        print("Sending to Replicate...")
+        
+        # Run HairFastGAN Model
+        output = replicate.run(
+            "air-forever/hairfastgan:b45b836693a0bde3f3af2c5eb3c0fb7042071a4f001c9b688d6c79a835560126",
+            input={
+                "face_image": open(user_path, "rb"),
+                "shape_image": open(ref_path, "rb"),
+                "color_image": open(ref_path, "rb"), # Use same ref for shape & color
+                "input_image": open(user_path, "rb")
+            }
+        )
+        
+        # Output is usually a URI or list of URIs
+        print(f"Replicate Output: {output}")
+        
+        # Clean up
+        try:
+            os.remove(user_path)
+            os.remove(ref_path)
+        except:
+            pass
+
+        return JSONResponse(content={
+            "status": "success",
+            "generated_image_url": str(output) 
+        })
+
+    except Exception as e:
+        print(f"Error in generate_hairstyle: {e}")
+        try:
+           if os.path.exists(user_path): os.remove(user_path)
+           if os.path.exists(ref_path): os.remove(ref_path)
+        except: pass
+        
+        return JSONResponse(content={"error": str(e)}, status_code=500)
